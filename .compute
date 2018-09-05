@@ -4,24 +4,30 @@ set -x
 
 source ../tmp/venv/bin/activate
 
-python3 -u filter_99_percentile.py "/snakepit/shared/data/mozilla/CommonVoice/v2.0-alpha1.0/en/cv_en_valid.csv" "../keep/cv_en_valid_99percentile.csv"
+# python3 -u filter_99_percentile.py "/snakepit/shared/data/mozilla/CommonVoice/v2.0-alpha1.0/en/cv_en_valid.csv" "../keep/cv_en_valid_99percentile.csv"
+
+mv "../keep/cv_en_valid_99percentile.csv" "../tmp/cv_en_valid_99percentile.csv"
+rm -rf "../keep/*"
+mv "../tmp/cv_en_valid_99percentile.csv" "../keep/cv_en_valid_99percentile.csv"
+
+python3 -u filter_cv1_val_test.py "../keep/cv_en_valid_99percentile.csv" "dev_paths.csv" "test_paths.csv" "../keep"
 
 python3 -u DeepSpeech.py \
-  --train_files "../keep/cv_en_valid_99percentile.csv" \
-  --dev_files "/snakepit/shared/data/OpenSLR/LibriSpeech/librivox-dev-clean.csv" \
+  --train_files "../keep/cv_en_valid_train.csv" \
+  --dev_files "/snakepit/shared/data/OpenSLR/LibriSpeech/librivox-dev-clean.csv,/snakepit/shared/data/OpenSLR/LibriSpeech/librivox-dev-other.csv,../keep/cv_en_valid_dev.csv" \
   --test_files "/snakepit/shared/data/OpenSLR/LibriSpeech/librivox-test-clean.csv" \
   --train_batch_size 24 \
   --dev_batch_size 48 \
   --test_batch_size 48 \
   --noearly_stop \
-  --epoch 1 \
+  --epoch 30 \
   --validation_step 1 \
+  --dropout_rate 0.2 \
   --learning_rate 0.0001 \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries" \
   --decoder_library_path "../tmp/libctc_decoder_with_kenlm.so" \
-  --train_cached_features_path "../tmp/cv_en_valid_99percentile.hdf5" \
-  --dev_cached_features_path "/snakepit/shared/data/mozilla/DeepSpeech/librivox-dev-clean.hdf5" \
+  --train_cached_features_path "../keep/librivox-fisher-swb-cv2.0-train.hdf5" \
   --test_cached_features_path "/snakepit/shared/data/mozilla/DeepSpeech/librivox-test-clean.hdf5" \
   "$@"
 
