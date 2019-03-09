@@ -17,6 +17,7 @@ then:
     else: { $fromNow: '7 days' }
 
   extra:
+    nc_asset_name: { $eval: build.nc_asset_name }
     github:
       $if: '(event.event == "push") || (event.event == "tag")'
       then: { $eval: taskcluster.github_events.merge }
@@ -36,9 +37,7 @@ then:
         training: { $eval: as_slugid("test-training_upstream-linux-amd64-py27mu-opt") }
       in:
         TENSORFLOW_BUILD_ARTIFACT: ${build.tensorflow}
-        SUMMARIZE_GRAPH_BINARY: ${build.summarize_graph}
         DEEPSPEECH_TEST_MODEL: https://queue.taskcluster.net/v1/task/${training}/artifacts/public/output_graph.pb
-        DEEPSPEECH_PROD_MODEL: https://github.com/lissyx/DeepSpeech/releases/download/0.0.2/tc-fake-prod.988_e120.LSTM.ldc93s1.pb
 
     command:
       - "/bin/bash"

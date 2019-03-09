@@ -1,15 +1,19 @@
 pandas
 progressbar2
 python-utils
-tensorflow == 1.6.0
-numpy
+tensorflow == 1.12.0
+numpy == 1.15.4
 matplotlib
 scipy
-paramiko >= 2.1
-pysftp
 sox
+paramiko >= 2.1
 python_speech_features
 pyxdg
 bs4
 six
 requests
+tables
+attrdict
+setuptools
+librosa
+soundfile

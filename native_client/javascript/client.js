@@ -15,11 +15,10 @@ const util = require('util');
 const BEAM_WIDTH = 500;
 
 // The alpha hyperparameter of the CTC decoder. Language Model weight
-const LM_WEIGHT = 1.75;
+const LM_ALPHA = 0.75;
 
-// Valid word insertion weight. This is used to lessen the word insertion penalty
-// when the inserted word is part of the vocabulary
-const VALID_WORD_COUNT_WEIGHT = 1.00;
+// The beta hyperparameter of the CTC decoder. Word insertion bonus.
+const LM_BETA = 1.85;
 
 
 // These constants are tied to the shape of the graph used (changing them changes
@@ -73,7 +72,20 @@ function bufferToStream(buffer) {
 
 var audioStream = new MemoryStream();
 bufferToStream(buffer).
-  pipe(Sox({ output: { bits: 16, rate: 16000, channels: 1, type: 'raw' } })).
+  pipe(Sox({
+    global: {
+      'no-dither': true,
+    },
+    output: {
+      bits: 16,
+      rate: 16000,
+      channels: 1,
+      encoding: 'signed-integer',
+      endian: 'little',
+      compression: 0.0,
+      type: 'raw'
+    }
+  })).
   pipe(audioStream);
 
 audioStream.on('finish', () => {
@@ -89,7 +101,7 @@ audioStream.on('finish', () => {
     console.error('Loading language model from files %s %s', args['lm'], args['trie']);
     const lm_load_start = process.hrtime();
     model.enableDecoderWithLM(args['alphabet'], args['lm'], args['trie'],
-                              LM_WEIGHT, VALID_WORD_COUNT_WEIGHT);
+                              LM_ALPHA, LM_BETA);
     const lm_load_end = process.hrtime(lm_load_start);
     console.error('Loaded language model in %ds.', totalTime(lm_load_end));
   }

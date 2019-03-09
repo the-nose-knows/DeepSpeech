@@ -1,53 +1,78 @@
-#ifdef DS_NATIVE_MODEL
-#define EIGEN_USE_THREADS
-#define EIGEN_USE_CUSTOM_THREAD_POOL
-
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
-
-#include "native_client/deepspeech_model_core.h" // generated
-#endif
-
 #include <algorithm>
+#ifdef _MSC_VER
+  #define _USE_MATH_DEFINES
+#endif
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "deepspeech.h"
 #include "alphabet.h"
-#include "beam_search.h"
 
-#include "tensorflow/core/public/version.h"
 #include "native_client/ds_version.h"
 
-#include "tensorflow/core/public/session.h"
-#include "tensorflow/core/platform/env.h"
-#include "tensorflow/core/util/memmapped_file_system.h"
+#ifndef USE_TFLITE
+  #include "tensorflow/core/public/session.h"
+  #include "tensorflow/core/platform/env.h"
+  #include "tensorflow/core/util/memmapped_file_system.h"
+#else // USE_TFLITE
+  #include "tensorflow/contrib/lite/model.h"
+  #include "tensorflow/contrib/lite/kernels/register.h"
+#endif // USE_TFLITE
 
 #include "c_speech_features.h"
 
+#include "ctcdecode/ctc_beam_search_decoder.h"
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#define  LOG_TAG    "libdeepspeech"
+#define  LOGD(...)  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define  LOGE(...)  __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+#define  LOGD(...)
+#define  LOGE(...)
+#endif // __ANDROID__
+
 //TODO: infer batch size from model/use dynamic batch size
-const unsigned int BATCH_SIZE = 1;
+constexpr unsigned int BATCH_SIZE = 1;
 
 //TODO: use dynamic sample rate
-const unsigned int SAMPLE_RATE = 16000;
+constexpr unsigned int SAMPLE_RATE = 16000;
 
-const float AUDIO_WIN_LEN = 0.025f;
-const float AUDIO_WIN_STEP = 0.01f;
-const unsigned int AUDIO_WIN_LEN_SAMPLES = (unsigned int)(AUDIO_WIN_LEN * SAMPLE_RATE);
-const unsigned int AUDIO_WIN_STEP_SAMPLES = (unsigned int)(AUDIO_WIN_STEP * SAMPLE_RATE);
+constexpr float AUDIO_WIN_LEN = 0.032f;
+constexpr float AUDIO_WIN_STEP = 0.02f;
+constexpr unsigned int AUDIO_WIN_LEN_SAMPLES = (unsigned int)(AUDIO_WIN_LEN * SAMPLE_RATE);
+constexpr unsigned int AUDIO_WIN_STEP_SAMPLES = (unsigned int)(AUDIO_WIN_STEP * SAMPLE_RATE);
 
-const unsigned int MFCC_FEATURES = 26;
+constexpr unsigned int MFCC_FEATURES = 26;
 
-const float PREEMPHASIS_COEFF = 0.97f;
-const unsigned int N_FFT = 512;
-const unsigned int N_FILTERS = 26;
-const unsigned int LOWFREQ = 0;
-const unsigned int CEP_LIFTER = 22;
+constexpr float PREEMPHASIS_COEFF = 0.97f;
+constexpr unsigned int N_FFT = 512;
+constexpr unsigned int N_FILTERS = 26;
+constexpr unsigned int LOWFREQ = 0;
+constexpr unsigned int CEP_LIFTER = 22;
 
-using namespace tensorflow;
-using tensorflow::ctc::CTCBeamSearchDecoder;
-using tensorflow::ctc::CTCDecoder;
+constexpr size_t WINDOW_SIZE = AUDIO_WIN_LEN * SAMPLE_RATE;
+
+std::array<float, WINDOW_SIZE> calc_hamming_window() {
+  std::array<float, WINDOW_SIZE> a{0};
+  for (int i = 0; i < WINDOW_SIZE; ++i) {
+    a[i] = 0.54 - 0.46 * std::cos(2*M_PI*i/(WINDOW_SIZE-1));
+  }
+  return a;
+}
+
+std::array<float, WINDOW_SIZE> hamming_window = calc_hamming_window();
+
+#ifndef USE_TFLITE
+  using namespace tensorflow;
+#else
+  using namespace tflite;
+#endif
 
 using std::vector;
 
@@ -86,7 +111,6 @@ struct StreamingState {
   float last_sample; // used for preemphasis
   vector<float> mfcc_buffer;
   vector<float> batch_buffer;
-  bool skip_next_mfcc;
   ModelState* model;
 
   void feedAudioContent(const short* buffer, unsigned int buffer_size);
@@ -101,18 +125,36 @@ struct StreamingState {
 };
 
 struct ModelState {
+#ifndef USE_TFLITE
   MemmappedEnv* mmap_env;
   Session* session;
   GraphDef graph_def;
+#else // USE_TFLITE
+  std::unique_ptr<Interpreter> interpreter;
+  std::unique_ptr<FlatBufferModel> fbmodel;
+#endif // USE_TFLITE
   unsigned int ncep;
   unsigned int ncontext;
   Alphabet* alphabet;
-  KenLMBeamScorer* scorer;
+  Scorer* scorer;
   unsigned int beam_width;
-  bool run_aot;
   unsigned int n_steps;
   unsigned int mfcc_feats_per_timestep;
   unsigned int n_context;
+
+#ifdef USE_TFLITE
+  size_t previous_state_size;
+  std::unique_ptr<float[]> previous_state_c_;
+  std::unique_ptr<float[]> previous_state_h_;
+
+  int input_node_idx;
+  int previous_state_c_idx;
+  int previous_state_h_idx;
+
+  int logits_idx;
+  int new_state_c_idx;
+  int new_state_h_idx;
+#endif
 
   ModelState();
   ~ModelState();
@@ -142,31 +184,43 @@ struct ModelState {
 };
 
 ModelState::ModelState()
-  : mmap_env(nullptr)
+  :
+#ifndef USE_TFLITE
+    mmap_env(nullptr)
   , session(nullptr)
+#else // USE_TFLITE
+    interpreter(nullptr)
+  , fbmodel(nullptr)
+#endif // USE_TFLITE
   , ncep(0)
   , ncontext(0)
   , alphabet(nullptr)
   , scorer(nullptr)
   , beam_width(0)
-  , run_aot(false)
   , n_steps(-1)
   , mfcc_feats_per_timestep(-1)
   , n_context(-1)
+#ifdef USE_TFLITE
+  , previous_state_size(0)
+  , previous_state_c_(nullptr)
+  , previous_state_h_(nullptr)
+#endif
 {
 }
 
 ModelState::~ModelState()
 {
+#ifndef USE_TFLITE
   if (session) {
     Status status = session->Close();
     if (!status.ok()) {
       std::cerr << "Error closing TensorFlow session: " << status << std::endl;
     }
   }
+  delete mmap_env;
+#endif // USE_TFLITE
 
   delete scorer;
-  delete mmap_env;
   delete alphabet;
 }
 
@@ -188,7 +242,7 @@ StreamingState::feedAudioContent(const short* buffer,
     // If the buffer is full, process and shift it
     if (audio_buffer.size() == AUDIO_WIN_LEN_SAMPLES) {
       processAudioWindow(audio_buffer);
-      // Shift data by one step of 10ms
+      // Shift data by one step
       std::rotate(audio_buffer.begin(), audio_buffer.begin() + AUDIO_WIN_STEP_SAMPLES, audio_buffer.end());
       audio_buffer.resize(audio_buffer.size() - AUDIO_WIN_STEP_SAMPLES);
     }
@@ -225,16 +279,11 @@ StreamingState::finishStream()
 void
 StreamingState::processAudioWindow(const vector<float>& buf)
 {
-  skip_next_mfcc = !skip_next_mfcc;
-  if (!skip_next_mfcc) { // Was true
-    return;
-  }
-
   // Compute MFCC features
   float* mfcc;
   int n_frames = csf_mfcc(buf.data(), buf.size(), SAMPLE_RATE,
                           AUDIO_WIN_LEN, AUDIO_WIN_STEP, MFCC_FEATURES, N_FILTERS, N_FFT,
-                          LOWFREQ, SAMPLE_RATE/2, 0.f, CEP_LIFTER, 1, nullptr,
+                          LOWFREQ, SAMPLE_RATE/2, 0.f, CEP_LIFTER, 1, hamming_window.data(),
                           &mfcc);
   assert(n_frames == 1);
 
@@ -297,116 +346,118 @@ ModelState::infer(const float* aMfcc, unsigned int n_frames, vector<float>& logi
 {
   const size_t num_classes = alphabet->GetSize() + 1; // +1 for blank
 
-  if (run_aot) {
-#ifdef DS_NATIVE_MODEL
-    Eigen::ThreadPool tp(2);  // Size the thread pool as appropriate.
-    Eigen::ThreadPoolDevice device(&tp, tp.NumThreads());
+#ifndef USE_TFLITE
+  Tensor input(DT_FLOAT, TensorShape({BATCH_SIZE, n_steps, 2*n_context+1, MFCC_FEATURES}));
 
-    nativeModel nm(nativeModel::AllocMode::RESULTS_PROFILES_AND_TEMPS_ONLY);
-    nm.set_thread_pool(&device);
+  auto input_mapped = input.flat<float>();
+  int i;
+  for (i = 0; i < n_frames*mfcc_feats_per_timestep; ++i) {
+    input_mapped(i) = aMfcc[i];
+  }
+  for (; i < n_steps*mfcc_feats_per_timestep; ++i) {
+    input_mapped(i) = 0;
+  }
 
-    for (int ot = 0; ot < n_frames; ot += DS_MODEL_TIMESTEPS) {
-      nm.set_arg0_data(&(aMfcc[ot * mfcc_feats_per_timestep]));
-      nm.Run();
+  Tensor input_lengths(DT_INT32, TensorShape({1}));
+  input_lengths.scalar<int>()() = n_frames;
 
-      // The CTCDecoder works with log-probs.
-      for (int t = 0; t < DS_MODEL_TIMESTEPS, (ot + t) < n_frames; ++t) {
-        for (int b = 0; b < BATCH_SIZE; ++b) {
-          for (int c = 0; c < num_classes; ++c) {
-            logits_output.push_back(nm.result0(t, b, c));
-          }
-        }
-      }
-    }
-#else
-    std::cerr << "No support for native model built-in." << std::endl;
+  vector<Tensor> outputs;
+  Status status = session->Run(
+    {{"input_node", input}, {"input_lengths", input_lengths}},
+    {"logits"}, {}, &outputs);
+
+  if (!status.ok()) {
+    std::cerr << "Error running session: " << status << "\n";
     return;
-#endif // DS_NATIVE_MODEL
-  } else {
-    Tensor input(DT_FLOAT, TensorShape({BATCH_SIZE, n_steps, mfcc_feats_per_timestep}));
+  }
 
-    auto input_mapped = input.tensor<float, 3>();
-    int idx = 0;
-    for (int i = 0; i < n_frames; i++) {
-      for (int j = 0; j < mfcc_feats_per_timestep; j++, idx++) {
-        input_mapped(0, i, j) = aMfcc[idx];
-      }
+  auto logits_mapped = outputs[0].flat<float>();
+  // The CTCDecoder works with log-probs.
+  for (int t = 0; t < n_frames * BATCH_SIZE * num_classes; ++t) {
+    logits_output.push_back(logits_mapped(t));
+  }
+#else // USE_TFLITE
+  // Feeding input_node
+  float* input_node = interpreter->typed_tensor<float>(input_node_idx);
+  {
+    int i;
+    for (i = 0; i < n_frames*mfcc_feats_per_timestep; ++i) {
+      input_node[i] = aMfcc[i];
     }
-
-    Tensor input_lengths(DT_INT32, TensorShape({1}));
-    input_lengths.scalar<int>()() = n_frames;
-
-    vector<Tensor> outputs;
-    Status status = session->Run(
-      {{"input_node", input}, {"input_lengths", input_lengths}},
-      {"logits"}, {}, &outputs);
-
-    if (!status.ok()) {
-      std::cerr << "Error running session: " << status << "\n";
-      return;
-    }
-
-    auto logits_mapped = outputs[0].flat<float>();
-    // The CTCDecoder works with log-probs.
-    for (int t = 0; t < n_frames * BATCH_SIZE * num_classes; ++t) {
-      logits_output.push_back(logits_mapped(t));
+    for (; i < n_steps*mfcc_feats_per_timestep; ++i) {
+      input_node[i] = 0;
     }
   }
+
+  assert(previous_state_size > 0);
+
+  // Feeding previous_state_c, previous_state_h
+  memcpy(interpreter->typed_tensor<float>(previous_state_c_idx), previous_state_c_.get(), sizeof(float) * previous_state_size);
+  memcpy(interpreter->typed_tensor<float>(previous_state_h_idx), previous_state_h_.get(), sizeof(float) * previous_state_size);
+
+  TfLiteStatus status = interpreter->Invoke();
+  if (status != kTfLiteOk) {
+    std::cerr << "Error running session: " << status << "\n";
+    return;
+  }
+
+  float* outputs = interpreter->typed_tensor<float>(logits_idx);
+
+  // The CTCDecoder works with log-probs.
+  for (int t = 0; t < n_frames * BATCH_SIZE * num_classes; ++t) {
+    logits_output.push_back(outputs[t]);
+  }
+
+  memcpy(previous_state_c_.get(), interpreter->typed_tensor<float>(new_state_c_idx), sizeof(float) * previous_state_size);
+  memcpy(previous_state_h_.get(), interpreter->typed_tensor<float>(new_state_h_idx), sizeof(float) * previous_state_size);
+#endif // USE_TFLITE
 }
 
 char*
 ModelState::decode(vector<float>& logits)
 {
-  const int top_paths = 1;
+  const int cutoff_top_n = 40;
+  const double cutoff_prob = 1.0;
   const size_t num_classes = alphabet->GetSize() + 1; // +1 for blank
   const int n_frames = logits.size() / (BATCH_SIZE * num_classes);
 
-  // Raw data containers (arrays of floats, ints, etc.).
-  int sequence_lengths[BATCH_SIZE] = {n_frames};
+  // Convert logits to double
+  vector<double> inputs(logits.begin(), logits.end());
 
-  // Convert data containers to the format accepted by the decoder, simply
-  // mapping the memory from the container to an Eigen::ArrayXi,::MatrixXf,
-  // using Eigen::Map.
-  Eigen::Map<const Eigen::ArrayXi> seq_len(&sequence_lengths[0], BATCH_SIZE);
-  vector<Eigen::Map<const Eigen::MatrixXf>> inputs;
-  inputs.reserve(n_frames);
-  for (int t = 0; t < n_frames; ++t) {
-    inputs.emplace_back(&logits[t * BATCH_SIZE * num_classes], BATCH_SIZE, num_classes);
-  }
+  // Vector of <probability, Output> pairs
+  vector<Output> out = ctc_beam_search_decoder(
+    inputs.data(), n_frames, num_classes, *alphabet, beam_width,
+    cutoff_prob, cutoff_top_n, scorer);
 
-  // Prepare containers for output and scores.
-  // CTCDecoder::Output is vector<vector<int>>
-  vector<CTCDecoder::Output> decoder_outputs(top_paths);
-  for (CTCDecoder::Output& output : decoder_outputs) {
-    output.resize(BATCH_SIZE);
-  }
-  float score[BATCH_SIZE][top_paths] = {{0.0}};
-  Eigen::Map<Eigen::MatrixXf> scores(&score[0][0], BATCH_SIZE, top_paths);
-
-  if (scorer == nullptr) {
-    CTCBeamSearchDecoder<>::DefaultBeamScorer default_scorer;
-    CTCBeamSearchDecoder<> decoder(num_classes,
-                                   beam_width,
-                                   &default_scorer,
-                                   BATCH_SIZE);
-    decoder.Decode(seq_len, inputs, &decoder_outputs, &scores).ok();
-  } else {
-    CTCBeamSearchDecoder<KenLMBeamState> decoder(num_classes,
-                                                 beam_width,
-                                                 scorer,
-                                                 BATCH_SIZE);
-    decoder.Decode(seq_len, inputs, &decoder_outputs, &scores).ok();
-  }
-
-  // Output is an array of shape (batch_size, top_paths, result_length).
-
-  std::stringstream output;
-  for (int64 character : decoder_outputs[0][0]) {
-    output << alphabet->StringFromLabel(character);
-  }
-
-  return strdup(output.str().c_str());
+  return strdup(alphabet->LabelsToString(out[0].tokens).c_str());
 }
+
+#ifdef USE_TFLITE
+int tflite_get_tensor_by_name(const ModelState* ctx, const vector<int>& list, const char* name)
+{
+  int rv = -1;
+
+  for (int i = 0; i < list.size(); ++i) {
+    const string& node_name = ctx->interpreter->tensor(list[i])->name;
+    if (node_name.compare(string(name)) == 0) {
+      rv = i;
+    }
+  }
+
+  assert(rv >= 0);
+  return rv;
+}
+
+int tflite_get_input_tensor_by_name(const ModelState* ctx, const char* name)
+{
+  return ctx->interpreter->inputs()[tflite_get_tensor_by_name(ctx, ctx->interpreter->inputs(), name)];
+}
+
+int tflite_get_output_tensor_by_name(const ModelState* ctx, const char* name)
+{
+  return ctx->interpreter->outputs()[tflite_get_tensor_by_name(ctx, ctx->interpreter->outputs(), name)];
+}
+#endif
 
 int
 DS_CreateModel(const char* aModelPath,
@@ -417,23 +468,24 @@ DS_CreateModel(const char* aModelPath,
                ModelState** retval)
 {
   std::unique_ptr<ModelState> model(new ModelState());
+#ifndef USE_TFLITE
   model->mmap_env   = new MemmappedEnv(Env::Default());
+#endif // USE_TFLITE
   model->ncep       = aNCep;
   model->ncontext   = aNContext;
   model->alphabet   = new Alphabet(aAlphabetConfigPath);
   model->beam_width = aBeamWidth;
-  model->run_aot    = false;
 
   *retval = nullptr;
 
   DS_PrintVersions();
 
   if (!aModelPath || strlen(aModelPath) < 1) {
-    std::cerr << "No model specified, will rely on built-in model." << std::endl;
-    model->run_aot = true;
-    return 0;
+    std::cerr << "No model specified, cannot continue." << std::endl;
+    return DS_ERR_NO_MODEL;
   }
 
+#ifndef USE_TFLITE
   Status status;
   SessionOptions options;
 
@@ -444,7 +496,7 @@ DS_CreateModel(const char* aModelPath,
     status = model->mmap_env->InitializeFromFile(aModelPath);
     if (!status.ok()) {
       std::cerr << status << std::endl;
-      return status.code();
+      return DS_ERR_FAIL_INIT_MMAP;
     }
 
     options.config.mutable_graph_options()
@@ -456,7 +508,7 @@ DS_CreateModel(const char* aModelPath,
   status = NewSession(options, &model->session);
   if (!status.ok()) {
     std::cerr << status << std::endl;
-    return status.code();
+    return DS_ERR_FAIL_INIT_SESS;
   }
 
   if (is_mmap) {
@@ -468,13 +520,13 @@ DS_CreateModel(const char* aModelPath,
   }
   if (!status.ok()) {
     std::cerr << status << std::endl;
-    return status.code();
+    return DS_ERR_FAIL_READ_PROTOBUF;
   }
 
   status = model->session->Create(model->graph_def);
   if (!status.ok()) {
     std::cerr << status << std::endl;
-    return status.code();
+    return DS_ERR_FAIL_CREATE_SESS;
   }
 
   for (int i = 0; i < model->graph_def.node_size(); ++i) {
@@ -482,9 +534,8 @@ DS_CreateModel(const char* aModelPath,
     if (node.name() == "input_node") {
       const auto& shape = node.attr().at("shape").shape();
       model->n_steps = shape.dim(1).size();
-      model->mfcc_feats_per_timestep = shape.dim(2).size();
-      // mfcc_features_per_timestep = MFCC_FEATURES * ((2*n_context) + 1)
-      model->n_context = (model->mfcc_feats_per_timestep - MFCC_FEATURES) / (2 * MFCC_FEATURES);
+      model->n_context = (shape.dim(2).size()-1)/2;
+      model->mfcc_feats_per_timestep = shape.dim(2).size() * shape.dim(3).size();
     } else if (node.name() == "logits_shape") {
       Tensor logits_shape = Tensor(DT_INT32, TensorShape({3}));
       if (!logits_shape.FromProto(node.attr().at("value").tensor())) {
@@ -499,7 +550,7 @@ DS_CreateModel(const char* aModelPath,
                   << " classes in its output. Make sure you're passing an alphabet "
                   << "file with the same size as the one used for training."
                   << std::endl;
-        return error::INVALID_ARGUMENT;
+        return DS_ERR_INVALID_ALPHABET;
       }
     }
   }
@@ -511,11 +562,72 @@ DS_CreateModel(const char* aModelPath,
               << "changed the number of features in the input, adjust the "
               << "MFCC_FEATURES constant in " __FILE__
               << std::endl;
-    return error::INVALID_ARGUMENT;
+    return DS_ERR_INVALID_SHAPE;
   }
 
   *retval = model.release();
-  return tensorflow::error::OK;
+  return DS_ERR_OK;
+#else // USE_TFLITE
+  TfLiteStatus status;
+
+  model->fbmodel = tflite::FlatBufferModel::BuildFromFile(aModelPath);
+  if (!model->fbmodel) {
+    std::cerr << "Error at reading model file " << aModelPath << std::endl;
+    return DS_ERR_FAIL_INIT_MMAP;
+  }
+
+
+  tflite::ops::builtin::BuiltinOpResolver resolver;
+  tflite::InterpreterBuilder(*model->fbmodel, resolver)(&model->interpreter);
+  if (!model->interpreter) {
+    std::cerr << "Error at InterpreterBuilder for model file " << aModelPath << std::endl;
+    return DS_ERR_FAIL_INTERPRETER;
+  }
+
+  model->interpreter->AllocateTensors();
+  model->interpreter->SetNumThreads(4);
+
+  // Query all the index once
+  model->input_node_idx       = tflite_get_input_tensor_by_name(model.get(), "input_node");
+  model->previous_state_c_idx = tflite_get_input_tensor_by_name(model.get(), "previous_state_c");
+  model->previous_state_h_idx = tflite_get_input_tensor_by_name(model.get(), "previous_state_h");
+  model->logits_idx           = tflite_get_output_tensor_by_name(model.get(), "logits");
+  model->new_state_c_idx      = tflite_get_output_tensor_by_name(model.get(), "new_state_c");
+  model->new_state_h_idx      = tflite_get_output_tensor_by_name(model.get(), "new_state_h");
+
+  TfLiteIntArray* dims_input_node = model->interpreter->tensor(model->input_node_idx)->dims;
+
+  model->n_steps = dims_input_node->data[1];
+  model->n_context = (dims_input_node->data[2] - 1 ) / 2;
+  model->mfcc_feats_per_timestep = dims_input_node->data[2] * dims_input_node->data[3];
+
+  TfLiteIntArray* dims_logits = model->interpreter->tensor(model->logits_idx)->dims;
+  const int final_dim_size = dims_logits->data[1] - 1;
+  if (final_dim_size != model->alphabet->GetSize()) {
+    std::cerr << "Error: Alphabet size does not match loaded model: alphabet "
+              << "has size " << model->alphabet->GetSize()
+              << ", but model has " << final_dim_size
+              << " classes in its output. Make sure you're passing an alphabet "
+              << "file with the same size as the one used for training."
+              << std::endl;
+    return DS_ERR_INVALID_ALPHABET;
+  }
+
+  TfLiteIntArray* dims_c = model->interpreter->tensor(model->previous_state_c_idx)->dims;
+  TfLiteIntArray* dims_h = model->interpreter->tensor(model->previous_state_h_idx)->dims;
+  assert(dims_c->data[1] == dims_h->data[1]);
+
+  model->previous_state_size = dims_c->data[1];
+  model->previous_state_c_.reset(new float[model->previous_state_size]());
+  model->previous_state_h_.reset(new float[model->previous_state_size]());
+
+  // Set initial values for previous_state_c and previous_state_h
+  memset(model->previous_state_c_.get(), 0, sizeof(float) * model->previous_state_size);
+  memset(model->previous_state_h_.get(), 0, sizeof(float) * model->previous_state_size);
+
+  *retval = model.release();
+  return DS_ERR_OK;
+#endif // USE_TFLITE
 }
 
 void
@@ -529,15 +641,17 @@ DS_EnableDecoderWithLM(ModelState* aCtx,
                        const char* aAlphabetConfigPath,
                        const char* aLMPath,
                        const char* aTriePath,
-                       float aLMWeight,
-                       float aValidWordCountWeight)
+                       float aLMAlpha,
+                       float aLMBeta)
 {
   try {
-    aCtx->scorer = new KenLMBeamScorer(aLMPath, aTriePath, aAlphabetConfigPath,
-                                       aLMWeight, aValidWordCountWeight);
-    return 0;
+    aCtx->scorer = new Scorer(aLMAlpha, aLMBeta,
+                              aLMPath ? aLMPath : "",
+                              aTriePath ? aTriePath : "",
+                              *aCtx->alphabet);
+    return DS_ERR_OK;
   } catch (...) {
-    return 1;
+    return DS_ERR_INVALID_LM;
   }
 }
 
@@ -549,7 +663,7 @@ DS_SpeechToText(ModelState* aCtx,
 {
   StreamingState* ctx;
   int status = DS_SetupStream(aCtx, 0, aSampleRate, &ctx);
-  if (status != tensorflow::error::OK) {
+  if (status != DS_ERR_OK) {
     return nullptr;
   }
   DS_FeedAudioContent(ctx, aBuffer, aBufferSize);
@@ -564,16 +678,18 @@ DS_SetupStream(ModelState* aCtx,
 {
   *retval = nullptr;
 
+#ifndef USE_TFLITE
   Status status = aCtx->session->Run({}, {}, {"initialize_state"}, nullptr);
   if (!status.ok()) {
     std::cerr << "Error running session: " << status << std::endl;
-    return status.code();
+    return DS_ERR_FAIL_RUN_SESS;
   }
+#endif // USE_TFLITE
 
   std::unique_ptr<StreamingState> ctx(new StreamingState());
   if (!ctx) {
     std::cerr << "Could not allocate streaming state." << std::endl;
-    return status.code();
+    return DS_ERR_FAIL_CREATE_STREAM;
   }
 
   const size_t num_classes = aCtx->alphabet->GetSize() + 1; // +1 for blank
@@ -591,12 +707,10 @@ DS_SetupStream(ModelState* aCtx,
   ctx->mfcc_buffer.resize(MFCC_FEATURES*aCtx->n_context, 0.f);
   ctx->batch_buffer.reserve(aCtx->n_steps * aCtx->mfcc_feats_per_timestep);
 
-  ctx->skip_next_mfcc = false;
-
   ctx->model = aCtx;
 
   *retval = ctx.release();
-  return tensorflow::error::OK;
+  return DS_ERR_OK;
 }
 
 void
@@ -697,7 +811,13 @@ DS_AudioToInputVector(const short* aBuffer,
 
 void
 DS_PrintVersions() {
-  std::cerr << "TensorFlow: " << tf_git_version() << std::endl;
+  std::cerr << "TensorFlow: " << tf_local_git_version() << std::endl;
   std::cerr << "DeepSpeech: " << ds_git_version() << std::endl;
+#ifdef __ANDROID__
+  LOGE("TensorFlow: %s", tf_local_git_version());
+  LOGD("TensorFlow: %s", tf_local_git_version());
+  LOGE("DeepSpeech: %s", ds_git_version());
+  LOGD("DeepSpeech: %s", ds_git_version());
+#endif
 }
 

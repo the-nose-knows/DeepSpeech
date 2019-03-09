@@ -23,11 +23,10 @@ except ImportError:
 BEAM_WIDTH = 500
 
 # The alpha hyperparameter of the CTC decoder. Language Model weight
-LM_WEIGHT = 1.75
+LM_ALPHA = 0.75
 
-# Valid word insertion weight. This is used to lessen the word insertion penalty
-# when the inserted word is part of the vocabulary
-VALID_WORD_COUNT_WEIGHT = 1.00
+# The beta hyperparameter of the CTC decoder. Word insertion bonus.
+LM_BETA = 1.85
 
 
 # These constants are tied to the shape of the graph used (changing them changes
@@ -41,7 +40,7 @@ N_FEATURES = 26
 N_CONTEXT = 9
 
 def convert_samplerate(audio_path):
-    sox_cmd = 'sox {} --type raw --bits 16 --channels 1 --rate 16000 - '.format(quote(audio_path))
+    sox_cmd = 'sox {} --type raw --bits 16 --channels 1 --rate 16000 --encoding signed-integer --endian little --compression 0.0 --no-dither - '.format(quote(audio_path))
     try:
         output = subprocess.check_output(shlex.split(sox_cmd), stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
@@ -85,8 +84,7 @@ def main():
     if args.lm and args.trie:
         print('Loading language model from files {} {}'.format(args.lm, args.trie), file=sys.stderr)
         lm_load_start = timer()
-        ds.enableDecoderWithLM(args.alphabet, args.lm, args.trie, LM_WEIGHT,
-                               VALID_WORD_COUNT_WEIGHT)
+        ds.enableDecoderWithLM(args.alphabet, args.lm, args.trie, LM_ALPHA, LM_BETA)
         lm_load_end = timer() - lm_load_start
         print('Loaded language model in {:.3}s.'.format(lm_load_end), file=sys.stderr)
 
